@@ -1,0 +1,11 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# JSP compilation workspace (Docker Tomcat)
+jsp_workspace/
+
+# Scan output
+*.csv
+*.jsonl

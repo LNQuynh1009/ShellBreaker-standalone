@@ -1,0 +1,12 @@
+services:
+  tomcat:
+    image: tomcat:10.1-jdk21
+    container_name: shellbreaker-tomcat
+    ports:
+      - "9090:8080"
+    volumes:
+      - ./jsp_workspace/webapps:/usr/local/tomcat/webapps/ROOT
+      - ./agent:/agent
+    environment:
+      JAVA_OPTS: "-javaagent:/agent/shellbreaker-agent.jar=/agent/sb_agent.log"
+    restart: unless-stopped

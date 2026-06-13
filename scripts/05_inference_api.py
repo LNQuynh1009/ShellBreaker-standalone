@@ -24,6 +24,7 @@ POST /predict  multipart: file=<.class bytes>
 GET  /threshold
 """
 
+import importlib.util
 import json
 import re
 import subprocess
@@ -424,6 +425,40 @@ class Predictor:
             feats = extract_xgb_features(ops, javap_text, class_path, self.vocab)
             return float(self.model.predict_proba(self._csr(feats.reshape(1, -1)))[0, 1])
 
+    def predict_from_javap(self, name_path: Path, javap_text: str) -> dict:
+        """Run the full ML+rule pipeline on pre-computed javap output.
+        Used for JSP analysis where the .class stays inside the Docker container."""
+        ops = []
+        for line in javap_text.splitlines():
+            m = _OPCODE_RE.match(line)
+            if m:
+                ops.append(OPCODE_NORM.get(m.group(1), m.group(1)))
+
+        if not ops:
+            rule = rule_check(name_path, javap_text)
+            if rule["triggered"]:
+                verdict, tier, dpath = combined_verdict(0.0, rule, self.inf_threshold)
+                return {"verdict": verdict, "tier": tier, "detection_path": dpath,
+                        "ml_score": None, "rule": rule, "backend": self.backend}
+            return {"verdict": "BENIGN", "tier": "BENIGN", "detection_path": "interface",
+                    "ml_score": None, "rule": rule_check(name_path, javap_text),
+                    "backend": self.backend}
+
+        if len(ops) < 4:
+            rule = rule_check(name_path, javap_text)
+            if rule["triggered"]:
+                verdict, tier, dpath = combined_verdict(0.0, rule, self.inf_threshold)
+                return {"verdict": verdict, "tier": tier, "detection_path": dpath,
+                        "ml_score": None, "rule": rule, "backend": self.backend}
+            return {"verdict": "BENIGN", "tier": "BENIGN", "detection_path": "interface",
+                    "ml_score": None, "rule": rule, "backend": self.backend}
+
+        ml_score            = self._ml_score(name_path, ops, javap_text)
+        rule                = rule_check(name_path, javap_text)
+        verdict, tier, path = combined_verdict(ml_score, rule, self.inf_threshold)
+        return {"verdict": verdict, "tier": tier, "detection_path": path,
+                "ml_score": round(ml_score, 4), "rule": rule, "backend": self.backend}
+
     def predict(self, class_path: Path) -> dict:
         ops, javap_text = disassemble(class_path)
 
@@ -433,33 +468,26 @@ class Predictor:
                 "ml_score": None,
                 "rule": {"triggered": False, "rules": [], "risk": "LOW"},
                 "reason": "javap failed",
+                "description": "Analysis error",
             }
 
         if len(ops) < 4:
-            # Interface / annotation / empty abstract class — no executable bytecode.
-            # ML cannot run (no opcode matrix), but the constant pool is still
-            # readable so the rule engine can catch tool strings or dangerous refs.
             rule = rule_check(class_path, javap_text)
             if rule["triggered"]:
                 verdict, tier, dpath = combined_verdict(0.0, rule, self.inf_threshold)
-                return {
-                    "verdict": verdict, "tier": tier,
-                    "detection_path": dpath,
-                    "ml_score": None, "rule": rule,
-                    "backend": self.backend,
-                }
-            return {
-                "verdict": "BENIGN", "tier": "BENIGN",
-                "detection_path": "interface",
-                "ml_score": None, "rule": rule,
-                "backend": self.backend,
-            }
+                r = {"verdict": verdict, "tier": tier, "detection_path": dpath,
+                     "ml_score": None, "rule": rule, "backend": self.backend}
+            else:
+                r = {"verdict": "BENIGN", "tier": "BENIGN", "detection_path": "interface",
+                     "ml_score": None, "rule": rule, "backend": self.backend}
+            r["description"] = describe_shell(r)
+            return r
 
-        ml_score               = self._ml_score(class_path, ops, javap_text)
-        rule                   = rule_check(class_path, javap_text)
-        verdict, tier, path    = combined_verdict(ml_score, rule, self.inf_threshold)
+        ml_score            = self._ml_score(class_path, ops, javap_text)
+        rule                = rule_check(class_path, javap_text)
+        verdict, tier, path = combined_verdict(ml_score, rule, self.inf_threshold)
 
-        return {
+        r = {
             "verdict":        verdict,
             "tier":           tier,
             "detection_path": path,
@@ -467,28 +495,416 @@ class Predictor:
             "rule":           rule,
             "backend":        self.backend,
         }
+        r["description"] = describe_shell(r)
+        return r
+
+# ---------------------------------------------------------------------------
+# JSP compilation helper
+# ---------------------------------------------------------------------------
+
+_JSP_COMPILER_MOD = None   # cached so _TOMCAT_READY flag persists across calls
+
+def _load_jsp_compiler():
+    global _JSP_COMPILER_MOD
+    if _JSP_COMPILER_MOD is None:
+        spec = importlib.util.spec_from_file_location(
+            "compile_jsp", Path(__file__).parent / "compile_jsp.py"
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _JSP_COMPILER_MOD = mod
+    return _JSP_COMPILER_MOD.compile_jsp
+
+
+# Imports that are standard Java/Servlet/JSTL — not interesting to report
+_STANDARD_IMPORT_PREFIXES = (
+    "java.", "javax.", "jakarta.", "org.w3c.", "org.xml.", "sun.",
+)
+
+_IMPORT_RE = re.compile(
+    r'<%@\s*page\b[^%]*\bimport\s*=\s*["\']([^"\']+)["\']',
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _extract_imports(src: str) -> list[str]:
+    """Return non-standard imports from <%@ page import="..." %> directives."""
+    imports: list[str] = []
+    for m in _IMPORT_RE.finditer(src):
+        for cls in m.group(1).split(","):
+            cls = cls.strip().rstrip("*").rstrip(".")
+            if cls and not any(cls.startswith(p) for p in _STANDARD_IMPORT_PREFIXES):
+                imports.append(cls)
+    return sorted(set(imports))
+
+
+def _normalize_escapes(src: str) -> str:
+    """Resolve Java/JSP Unicode (\\uXXXX) and octal (\\NNN) escapes so pattern
+    matching works even on heavily obfuscated source."""
+    # Unicode escapes
+    src = re.sub(
+        r'\\u([0-9a-fA-F]{4})',
+        lambda m: chr(int(m.group(1), 16)),
+        src,
+    )
+    # Octal escapes inside string literals (0–127 only to avoid false matches)
+    src = re.sub(
+        r'\\([0-7]{1,3})',
+        lambda m: chr(int(m.group(1), 8)) if int(m.group(1), 8) < 128 else m.group(0),
+        src,
+    )
+    return src
+
+
+_SRC_PATTERNS: list[tuple] = [
+    # Command execution — catches both chained and two-statement forms:
+    #   Runtime.getRuntime().exec(...)
+    #   Runtime run = Runtime.getRuntime(); run.exec(...)
+    (re.compile(r"Runtime\.getRuntime\(\)\.exec|Runtime\.exec\b|getRuntime\s*\(\s*\)", re.I), "api:runtime_exec", 3),
+    (re.compile(r"\.exec\s*\(",                                   re.I), "api:exec_call",          2),
+    (re.compile(r"ProcessBuilder",                                  re.I), "api:processbuilder",   3),
+    # Class loading / code injection
+    (re.compile(r"defineClass\s*\(",                                re.I), "api:defineClass",      3),
+    (re.compile(r"URLClassLoader",                                  re.I), "api:url_classloader",  2),
+    (re.compile(r"javax\.tools\.JavaCompiler",                      re.I), "api:in_memory_compile",3),
+    (re.compile(r"groovy\.lang\.GroovyClassLoader|GroovyShell",     re.I), "api:groovy_exec",      2),
+    # Reflection abuse
+    (re.compile(r"setAccessible\s*\(\s*true",                       re.I), "api:reflection_bypass",1),
+    (re.compile(r"\.invoke\s*\(",                                   re.I), "api:reflect_invoke",   1),
+    # Scripting / expression engines (OGNL eval = arbitrary code exec)
+    (re.compile(r"ScriptEngine|ScriptEngineManager",                re.I), "api:script_engine",    2),
+    (re.compile(r"ognl\.Ognl|OgnlContext|Ognl\.getValue",           re.I), "api:ognl_exec",        3),
+    (re.compile(r"ELProcessor|ExpressionFactory|ELContext",         re.I), "api:el_exec",          2),
+    # File write (backdoor dropper / file manager shells)
+    (re.compile(r"FileOutputStream|FileWriter|RandomAccessFile|new\s+PrintWriter\s*\(", re.I), "api:file_write", 2),
+    (re.compile(r"new\s+String\s*\(\s*new\s+char\s*\[",              re.I), "api:char_array_obf",   1),
+    (re.compile(r"getBytes\(\)|getBytes\s*\(['\"]",                 re.I), "api:bytes_write",      1),
+    # Network / reverse shell
+    (re.compile(r"Socket\s*\(|ServerSocket\s*\(",                   re.I), "api:socket",           2),
+    # Misc dangerous
+    (re.compile(r"sun\.misc\.Unsafe",                               re.I), "api:unsafe_api",       2),
+    # Known tool fingerprints
+    (re.compile(
+        r"godzilla|behinder|icescorpion|regeorg|antsword|memshell|"
+        r"JspDo|jspspy|jsp_kit|webacoo|b374k|laudanum",
+        re.I,
+    ), "tool:fingerprint", 4),
+]
+
+
+def _jsp_source_scan(jsp_path: Path) -> dict:
+    """
+    Rule-based scan of raw JSP source — fallback when Jasper cannot compile.
+    Also normalises Unicode/octal escapes before scanning so obfuscated shells
+    are not invisible to pattern matching.
+    Extracts non-standard imports so analysts know which app classes to follow up.
+    """
+    try:
+        raw = jsp_path.read_text(errors="replace")
+    except Exception:
+        return {"verdict": "ERROR", "tier": "ERROR", "ml_score": None,
+                "rule": {"triggered": False, "rules": [], "risk": "LOW"},
+                "detection_path": "jsp_source", "reason": "unreadable"}
+
+    # Normalise escapes before pattern matching
+    src = _normalize_escapes(raw)
+
+    rules: list[str] = []
+    score = 0
+
+    for pat, label, pts in _SRC_PATTERNS:
+        if pat.search(src):
+            rules.append(label)
+            score += pts
+
+    stem = jsp_path.stem.lower()
+    for kw in _SUSPICIOUS_KEYWORDS:
+        if kw in stem:
+            rules.append(f"name:{kw}")
+            score += 2
+            break
+
+    # Always extract non-standard imports — useful even for BENIGN verdicts
+    app_imports = _extract_imports(raw)
+
+    base = {
+        "ml_score":      None,
+        "detection_path": "jsp_source",
+        "imports":        app_imports,
+    }
+
+    if not rules:
+        return {**base,
+                "verdict": "BENIGN", "tier": "BENIGN",
+                "rule": {"triggered": False, "rules": [], "risk": "LOW", "score": 0}}
+
+    risk = "HIGH" if score >= 6 else "MEDIUM"
+    rule = {"triggered": True, "rules": rules, "risk": risk, "score": score}
+    tier = "CONFIRMED" if risk == "HIGH" else "HIGH"
+    return {**base, "verdict": "WEBSHELL", "tier": tier, "rule": rule}
+
+
+_SCRIPTLET_CONTENT_RE = re.compile(r'<%(?!@)(=|!)?.*?%>', re.DOTALL)
+
+
+# ---------------------------------------------------------------------------
+# Shell description generator
+# ---------------------------------------------------------------------------
+
+def describe_shell(result: dict) -> str:
+    """
+    Return a one-line analyst-facing description of what the shell is and
+    what it can do, based on detection path, rules, and dynamic hits.
+    """
+    rules      = set(result.get("rule", {}).get("rules", []))
+    dpath      = result.get("detection_path", "")
+    ml_score   = result.get("ml_score")
+    tier       = result.get("tier", "")
+    verdict    = result.get("verdict", "")
+
+    if verdict == "BENIGN":
+        return "No webshell indicators detected"
+    if tier == "ERROR":
+        return "Analysis error"
+
+    # --- Shell category (fileless vs file-based vs source-only) ---
+    has_iface = any(r.startswith("iface:") for r in rules)
+    is_dynamic = "+dynamic" in dpath or dpath == "dynamic"
+    is_source  = "jsp_source" in dpath and not is_dynamic
+
+    # Determine injection type from interface labels
+    iface_labels = [r[len("iface:"):] for r in rules if r.startswith("iface:")]
+    if any(x in iface_labels for x in ("Filter",)):
+        shell_type = "Filter memory shell (fileless)"
+    elif any(x in iface_labels for x in ("Valve", "ValveBase")):
+        shell_type = "Tomcat Valve memory shell (fileless)"
+    elif any(x in iface_labels for x in ("HandlerInterceptor",)):
+        shell_type = "Spring interceptor memory shell (fileless)"
+    elif any(x in iface_labels for x in ("ClassFileTransformer",)):
+        shell_type = "Java agent memory shell (fileless — instruments JVM bytecode)"
+    elif any(x in iface_labels for x in ("Endpoint", "ServerEndpointConfig$Configurator",
+                                          "WebSocketHandler", "ChannelHandler",
+                                          "ChannelInboundHandler")):
+        shell_type = "WebSocket/Netty memory shell (fileless)"
+    elif any(x in iface_labels for x in ("HttpServlet", "Servlet",
+                                          "ServletContextListener",
+                                          "ServletRequestListener",
+                                          "HttpSessionListener")):
+        shell_type = "Servlet/listener memory shell (fileless)"
+    elif is_source:
+        shell_type = "JSP webshell (source-based detection)"
+    elif ml_score is not None:
+        shell_type = "File-based webshell (bytecode anomaly)"
+    else:
+        shell_type = "Webshell (unclassified)"
+
+    # --- Capabilities ---
+    caps: list[str] = []
+
+    exec_rules = {"api:runtime_exec", "api:exec_call", "api:processbuilder",
+                  "dynamic:api:runtime_exec", "dynamic:api:processbuilder"}
+    if rules & exec_rules:
+        verb = "CONFIRMED OS command execution" if is_dynamic and rules & {
+            "dynamic:api:runtime_exec", "dynamic:api:processbuilder"} \
+            else "OS command execution"
+        caps.append(verb)
+
+    if "api:defineClass" in rules or "dynamic:api:defineClass" in rules:
+        verb = "CONFIRMED bytecode injection" if "dynamic:api:defineClass" in rules \
+            else "bytecode injection (loads class at runtime)"
+        caps.append(verb)
+
+    if "api:url_classloader" in rules:
+        caps.append("remote class loading (URLClassLoader)")
+
+    if "api:in_memory_compile" in rules:
+        caps.append("in-memory Java compilation (JavaCompiler)")
+
+    if "api:groovy_exec" in rules:
+        caps.append("Groovy script execution (arbitrary code)")
+
+    if "api:script_engine" in rules:
+        caps.append("ScriptEngine execution (JS/Groovy eval)")
+
+    if "api:ognl_exec" in rules:
+        caps.append("OGNL expression evaluation (Struts2-style RCE)")
+
+    if "api:el_exec" in rules:
+        caps.append("EL expression evaluation (Spring/JSF RCE)")
+
+    write_rules = {"api:file_write", "api:bytes_write", "dynamic:api:file_write"}
+    if rules & write_rules:
+        verb = "CONFIRMED file write" if "dynamic:api:file_write" in rules \
+            else "arbitrary file write (dropper/file manager)"
+        caps.append(verb)
+
+    if "api:socket" in rules or "dynamic:api:socket" in rules:
+        verb = "CONFIRMED network socket" if "dynamic:api:socket" in rules \
+            else "network socket (reverse shell / C2)"
+        caps.append(verb)
+
+    if "api:reflection_bypass" in rules or "api:reflect_invoke" in rules:
+        caps.append("reflection abuse (bypasses access control)")
+
+    if "api:unsafe_api" in rules:
+        caps.append("sun.misc.Unsafe (low-level JVM manipulation)")
+
+    if "tool:fingerprint" in rules:
+        # Try to get the specific tool name from the rule string
+        tool_rules = [r for r in result.get("rule", {}).get("rules", [])
+                      if r.startswith("tool:")]
+        tool_name = tool_rules[0].replace("tool:", "") if tool_rules else "known tool"
+        caps.append(f"matches known webshell signature ({tool_name})")
+
+    if "api:char_array_obf" in rules:
+        caps.append("char-array string obfuscation (evasion)")
+
+    if "import:app_class_dependency" in rules:
+        imps = result.get("imports", [])
+        imp_str = ", ".join(imps[:3]) if imps else "unknown"
+        caps.append(f"shell logic in app dependency ({imp_str})")
+
+    # Name-based
+    name_rules = [r[len("name:"):] for r in rules if r.startswith("name:")]
+    if name_rules:
+        caps.append(f"suspicious filename keyword ({', '.join(name_rules)})")
+
+    # --- Assemble ---
+    if caps:
+        return f"{shell_type} — {'; '.join(caps)}"
+    elif ml_score is not None:
+        return f"{shell_type} — ML anomaly score {ml_score:.4f}"
+    else:
+        return shell_type
+
+
+# Dynamic hits that guarantee CONFIRMED (we literally watched it execute)
+_DYNAMIC_CONFIRM = {"api:runtime_exec", "api:processbuilder", "api:defineClass"}
+# Dynamic scores for rule recalculation
+_DYNAMIC_SCORES  = {"api:runtime_exec": 3, "api:processbuilder": 3,
+                    "api:defineClass": 3, "api:file_write": 2, "api:socket": 2}
+
+
+def _apply_dynamic_hits(result: dict, dynamic_hits: list[str]) -> dict:
+    """Merge Java-agent dynamic hits into a result dict, upgrading tier if warranted."""
+    if not dynamic_hits:
+        return result
+
+    rule = result.setdefault("rule", {"triggered": False, "rules": [], "risk": "LOW", "score": 0})
+    existing = set(rule.get("rules", []))
+    new_hits  = [h for h in dynamic_hits if h not in existing]
+
+    if not new_hits:
+        return result
+
+    rule["rules"]     = rule.get("rules", []) + [f"dynamic:{h}" for h in new_hits]
+    rule["triggered"] = True
+    extra_score       = sum(_DYNAMIC_SCORES.get(h, 1) for h in new_hits)
+    rule["score"]     = rule.get("score", 0) + extra_score
+    rule["risk"]      = "HIGH" if rule["score"] >= 3 else "MEDIUM"
+
+    dpath = result.get("detection_path", "")
+    result["detection_path"] = dpath + ("+dynamic" if dpath else "dynamic")
+
+    # Verdict upgrade: confirmed exec/injection = CONFIRMED; anything else = at least HIGH
+    if any(h in _DYNAMIC_CONFIRM for h in new_hits):
+        result["verdict"] = "WEBSHELL"
+        result["tier"]    = "CONFIRMED"
+    elif result.get("tier") in ("BENIGN", "MEDIUM", "HIGH"):
+        result["verdict"] = "WEBSHELL"
+        result["tier"]    = "HIGH" if result.get("tier") != "CONFIRMED" else "CONFIRMED"
+
+    return result
+
+
+def _compile_and_pick_worst(jsp_path: Path, predictor: "Predictor") -> tuple[dict, list[Path]]:
+    """
+    Compile a JSP via Docker Tomcat, run ML+rule detector on the javap output,
+    and merge any Java-agent dynamic hits.  Falls back to source scan on failure.
+
+    Option B heuristic: if compilation fails AND the JSP has non-standard
+    imports AND has Java scriptlet blocks, escalate to MEDIUM.
+    """
+    compile_jsp = _load_jsp_compiler()
+
+    try:
+        javap_text, dynamic_hits = compile_jsp(jsp_path)
+    except RuntimeError:
+        src_result = _jsp_source_scan(jsp_path)
+
+        # Escalate: non-standard imports + scriptlet code = unresolvable dependency shell
+        if src_result.get("tier") == "BENIGN" and src_result.get("imports"):
+            try:
+                raw = jsp_path.read_text(errors="replace")
+            except Exception:
+                raw = ""
+            if _SCRIPTLET_CONTENT_RE.search(raw):
+                src_result = {
+                    **src_result,
+                    "verdict": "WEBSHELL",
+                    "tier": "MEDIUM",
+                    "rule": {
+                        "triggered": True,
+                        "rules": ["import:app_class_dependency"],
+                        "risk": "MEDIUM",
+                        "score": 2,
+                    },
+                }
+
+        src_result["description"] = describe_shell(src_result)
+        return src_result, []
+
+    result = predictor.predict_from_javap(jsp_path, javap_text)
+    result = _apply_dynamic_hits(result, dynamic_hits)
+    result["description"] = describe_shell(result)
+    return result, []
+
 
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
-def cli_mode(class_file: str):
-    path = Path(class_file)
+def cli_mode(input_file: str):
+    path = Path(input_file)
     if not path.exists():
         print(f"File not found: {path}"); sys.exit(1)
 
+    is_jsp = path.suffix.lower() == ".jsp"
+    if not is_jsp and path.suffix.lower() != ".class":
+        print(f"Only .class or .jsp files are supported (got: {path.suffix})")
+        sys.exit(1)
+
     predictor = Predictor()
-    result    = predictor.predict(path)
+    temp_files: list[Path] = []
+
+    try:
+        if is_jsp:
+            print(f"\n  Compiling JSP via Docker Tomcat ...")
+            result, temp_files = _compile_and_pick_worst(path, predictor)
+        else:
+            result = predictor.predict(path)
+    except RuntimeError as e:
+        print(f"\n  [ERROR] {e}")
+        sys.exit(1)
+    finally:
+        for f in temp_files:
+            f.unlink(missing_ok=True)
 
     colours = {"CONFIRMED":"\033[91m","HIGH":"\033[91m","MEDIUM":"\033[93m",
                "BENIGN":"\033[92m","ERROR":"\033[90m"}
     c = colours.get(result["tier"], ""); rst = "\033[0m"
 
-    dpath     = result.get("detection_path", "unknown")
-    priority  = "rules-first" if dpath == "fileless" else "ML-first"
+    dpath    = result.get("detection_path", "unknown")
+    if dpath == "jsp_source":
+        priority = "source-scan (compile failed)"
+    elif dpath == "fileless":
+        priority = "rules-first"
+    else:
+        priority = "ML-first"
 
-    print(f"\n  File    : {path.name}")
+    print(f"\n  File    : {path.name}{' (compiled from JSP)' if is_jsp else ''}")
     print(f"  Verdict : {c}{result['verdict']} [{result['tier']}]{rst}")
+    print(f"  Summary : {result.get('description', '')}")
     print(f"  Path    : {dpath} ({priority})")
     print(f"  ML score: {result['ml_score']}")
     rule = result["rule"]
@@ -496,6 +912,9 @@ def cli_mode(class_file: str):
         print(f"  Rules   : [{rule['risk']}] {'; '.join(rule['rules'])}")
     else:
         print(f"  Rules   : none triggered")
+    imports = result.get("imports")
+    if imports:
+        print(f"  Imports : {', '.join(imports)}")
 
 # ---------------------------------------------------------------------------
 # FastAPI server
@@ -515,17 +934,36 @@ def run_server():
 
     @app.post("/predict")
     async def predict(file: UploadFile = File(...)):
-        if not file.filename.endswith(".class"):
-            raise HTTPException(400, "Only .class files accepted")
+        name   = file.filename or ""
+        suffix = Path(name).suffix.lower()
+        if suffix not in (".class", ".jsp"):
+            raise HTTPException(400, "Only .class or .jsp files accepted")
+
         data = await file.read()
-        with tempfile.NamedTemporaryFile(suffix=".class", delete=False) as tmp:
-            tmp.write(data); tmp_path = Path(tmp.name)
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+            tmp.write(data)
+            tmp_path = Path(tmp.name)
+            if suffix == ".jsp":
+                # Give it the original filename so Tomcat produces a sensible class name.
+                named_tmp = tmp_path.parent / name
+                tmp_path.rename(named_tmp)
+                tmp_path = named_tmp
+
+        temp_files = [tmp_path]
         try:
-            result = predictor.predict(tmp_path)
+            if suffix == ".jsp":
+                result, compiled = _compile_and_pick_worst(tmp_path, predictor)
+                temp_files.extend(compiled)
+            else:
+                result = predictor.predict(tmp_path)
+        except RuntimeError as e:
+            raise HTTPException(500, str(e))
         finally:
-            tmp_path.unlink(missing_ok=True)
+            for f in temp_files:
+                f.unlink(missing_ok=True)
+
         with open(LOG_PATH, "a") as f:
-            f.write(json.dumps({"ts": int(time.time()), "file": file.filename, **result}) + "\n")
+            f.write(json.dumps({"ts": int(time.time()), "file": name, **result}) + "\n")
         return JSONResponse(content=result)
 
     @app.get("/threshold")
@@ -550,14 +988,15 @@ def run_server():
         }
 
     print("\nStarting ShellBreaker API  http://localhost:8080")
-    print("  POST /predict   — submit .class file")
-    print("  GET  /threshold — view tiers")
-    print("  GET  /docs      — Swagger UI\n")
+    print("  POST /predict   -- submit .class or .jsp file")
+    print("  GET  /threshold -- view tiers")
+    print("  GET  /docs      -- Swagger UI")
+    print("  Note: .jsp analysis requires Docker (docker compose up -d)\n")
     uvicorn.run(app, host="0.0.0.0", port=8080)
 
 
 if __name__ == "__main__":
     if len(sys.argv) > 1:
-        cli_mode(sys.argv[1])
+        cli_mode(sys.argv[1])   # accepts .class or .jsp
     else:
         run_server()
