@@ -35,7 +35,7 @@ from pathlib import Path
 
 ROOT        = Path(__file__).parent.parent
 WEBAPPS_DIR = ROOT / "jsp_workspace" / "webapps"
-TOMCAT_URL  = "http://localhost:9090"
+TOMCAT_URL  = os.environ.get("TOMCAT_URL", "http://localhost:9090")
 CONTAINER   = "shellbreaker-tomcat"
 WORK_PATH   = "/usr/local/tomcat/work"
 AGENT_LOG   = ROOT / "agent" / "sb_agent.log"
@@ -73,6 +73,58 @@ def _docker(args: list[str], **kwargs) -> subprocess.CompletedProcess:
 # ---------------------------------------------------------------------------
 # Tomcat lifecycle (idempotent — only runs once per process)
 # ---------------------------------------------------------------------------
+
+def try_ensure_tomcat() -> bool:
+    """Non-fatal version of ensure_tomcat(). Returns True if Tomcat is ready,
+    False if Docker is unavailable or the container cannot be started."""
+    global _DOCKER_ENV, _TOMCAT_READY
+    if _TOMCAT_READY:
+        return True
+    _DOCKER_ENV = _resolve_docker_host()
+    try:
+        _docker(["info"], capture_output=True, check=True, timeout=5)
+    except Exception:
+        return False
+
+    r = _docker(["inspect", "-f", "{{.State.Running}}", CONTAINER],
+                capture_output=True, text=True, timeout=5)
+    if r.stdout.strip() != "true":
+        print("  Starting Tomcat container (first pull may take ~30 s) ...")
+        WEBAPPS_DIR.mkdir(parents=True, exist_ok=True)
+        env = os.environ.copy(); env.update(_DOCKER_ENV)
+        r = subprocess.run(
+            ["docker", "compose", "-f", str(ROOT / "docker-compose.yml"),
+             "up", "-d", "tomcat"],
+            capture_output=True, text=True, env=env,
+        )
+        if r.returncode != 0:
+            return False
+
+    WEBAPPS_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        WEBAPPS_DIR.chmod(0o777)
+    except PermissionError:
+        pass
+
+    print("  Waiting for Tomcat ...", end="", flush=True)
+    for _ in range(60):
+        try:
+            urllib.request.urlopen(f"{TOMCAT_URL}/", timeout=2)
+            break
+        except urllib.error.HTTPError:
+            break
+        except Exception:
+            print(".", end="", flush=True)
+            time.sleep(1)
+    else:
+        print(f"\n  [WARN] Tomcat not ready — falling back to local compilation.",
+              file=sys.stderr)
+        return False
+
+    print(" ready.")
+    _TOMCAT_READY = True
+    return True
+
 
 def ensure_tomcat() -> None:
     global _DOCKER_ENV, _TOMCAT_READY
@@ -139,9 +191,43 @@ def ensure_tomcat() -> None:
 
 _PAGE_DIR_RE = re.compile(r'<%@\s*page\b.*?%>',    re.DOTALL | re.IGNORECASE)
 _SCRIPTLET_RE = re.compile(r'<%(?!@)(=|!)?.*?%>', re.DOTALL)
+_TAGLIB_RE    = re.compile(r'<%@\s*taglib\b.*?%>', re.DOTALL | re.IGNORECASE)
 
+# Removed-API import lines — stripped so Jasper doesn't reject them
+_REMOVED_IMPORTS = re.compile(
+    r'<%@\s*page\s+import\s*=\s*"(sun\.misc\.BASE64(?:De|En)coder'
+    r'|sun\.misc\.BASE64'
+    r'|com\.sun\.[^"]*)"[^%]*%>\s*\n?',
+    re.IGNORECASE,
+)
 
-_TAGLIB_RE = re.compile(r'<%@\s*taglib\b.*?%>', re.DOTALL | re.IGNORECASE)
+def _compat_rewrite(source: str) -> str:
+    """Replace removed JDK APIs so the JSP compiles on JDK 11+.
+    Substitutions preserve the dangerous logic — only the API surface changes."""
+    # Drop import directives for removed sun.misc.BASE64* classes
+    source = _REMOVED_IMPORTS.sub("", source)
+    # Replace BASE64Decoder usage with java.util.Base64 equivalent
+    source = re.sub(
+        r'new\s+BASE64Decoder\(\)\.decodeBuffer\(',
+        'java.util.Base64.getDecoder().decode(',
+        source,
+    )
+    source = re.sub(
+        r'new\s+sun\.misc\.BASE64Decoder\(\)\.decodeBuffer\(',
+        'java.util.Base64.getDecoder().decode(',
+        source,
+    )
+    source = re.sub(
+        r'new\s+BASE64Encoder\(\)\.encode\(',
+        'java.util.Base64.getEncoder().encodeToString(',
+        source,
+    )
+    source = re.sub(
+        r'new\s+sun\.misc\.BASE64Encoder\(\)\.encode\(',
+        'java.util.Base64.getEncoder().encodeToString(',
+        source,
+    )
+    return source
 
 def _strip_to_scriptlets(source: str) -> str | None:
     """Keep <%@ page %> + all scriptlet blocks; drop taglibs, HTML, custom tags.
@@ -155,6 +241,9 @@ def _strip_to_scriptlets(source: str) -> str | None:
     # Ensure Jasper always has at least one page directive to compile against
     if not page_dirs:
         page_dirs = ['<%@ page contentType="text/html;charset=UTF-8" language="java" %>']
+    # Tomcat 10 uses jakarta.servlet.*; older JSPs import javax.servlet.* — rewrite
+    page_dirs = [d.replace("javax.servlet", "jakarta.servlet")
+                  .replace("javax.websocket", "jakarta.websocket") for d in page_dirs]
     return "\n".join(page_dirs + scriptlets)
 
 
@@ -209,16 +298,29 @@ def _clear_agent_log() -> None:
         pass
 
 
-def _read_agent_log() -> list[str]:
-    """Return deduplicated API labels captured during the last HTTP trigger."""
+def _read_agent_log(since_ms: int = 0) -> list[str]:
+    """Return deduplicated API labels logged at or after since_ms.
+    Strips the 'api:' prefix so labels match _DANGER_DYNAMIC in scan_bulk.py.
+    since_ms prevents hits from a previous JSP bleeding into the current one."""
     try:
         if not AGENT_LOG.exists():
             return []
         labels: set[str] = set()
         for line in AGENT_LOG.read_text(errors="replace").splitlines():
             parts = line.split("|")
-            if len(parts) >= 2 and parts[1]:
-                labels.add(parts[1])
+            if len(parts) < 2 or not parts[1]:
+                continue
+            # Filter by timestamp to avoid bleed from previous JSP executions
+            if since_ms:
+                try:
+                    if int(parts[0]) < since_ms:
+                        continue
+                except ValueError:
+                    pass
+            label = parts[1]
+            if label.startswith("api:"):
+                label = label[4:]
+            labels.add(label)
         return sorted(labels)
     except Exception:
         return []
@@ -236,6 +338,7 @@ def _compile_one(deploy_name: str, source: str) -> tuple[str, list[str]]:
     Returns ("", []) if compilation produced no class file.
     """
     _clear_agent_log()
+    request_start_ms = int(time.time() * 1000)
 
     deploy_path = WEBAPPS_DIR / deploy_name
     deploy_path.write_text(source, encoding="utf-8", errors="replace")
@@ -265,8 +368,8 @@ def _compile_one(deploy_name: str, source: str) -> tuple[str, list[str]]:
     finally:
         deploy_path.unlink(missing_ok=True)
 
-    # Read dynamic hits captured by the Java agent during JSP execution
-    dynamic_hits = _read_agent_log()
+    # Read dynamic hits — only entries logged after this request started
+    dynamic_hits = _read_agent_log(since_ms=request_start_ms)
 
     # Find the compiled .class inside the container (one call, no polling).
     r = _docker(
@@ -294,6 +397,62 @@ def _compile_one(deploy_name: str, source: str) -> tuple[str, list[str]]:
 
 
 # ---------------------------------------------------------------------------
+# Source compatibility fixes applied before deploying to Jasper
+# ---------------------------------------------------------------------------
+
+def _compat_source(source: str) -> str:
+    """Normalise JSP source for JDK-11 / Tomcat-10 compilation.
+
+    Three classes of fix:
+    1. charset/pageEncoding mismatch — Jasper reads by declared charset but we
+       deploy as UTF-8; replace non-UTF-8 charset declarations so Jasper uses
+       the same encoding we wrote.
+    2. 'enum' as variable name — reserved since Java 5, rejected by JDK 11.
+       Rename every bare 'enum' token to 'enumIt'.
+    3. Oracle JDBC imports — oracle.jdbc is not on the Tomcat classpath; strip
+       those import directives so the compile doesn't abort on missing class.
+    """
+    import re as _re
+
+    # 0. Decode unicode (\uXXXX) and octal (\0-\377) escapes so later patterns
+    #    can match identifiers that were written as e.g. enum (= "enum") or
+    #    request.getRealPath (= "getRealPath").  Must run before all other
+    #    fixes because Java compilers process these at the token level.
+    source = _re.sub(r'\\u([0-9a-fA-F]{4})',
+                     lambda m: chr(int(m.group(1), 16)), source)
+    source = _re.sub(r'\\([0-7]{1,3})',
+                     lambda m: chr(int(m.group(1), 8)) if int(m.group(1), 8) < 128 else m.group(0),
+                     source)
+
+    # 1. Normalise charset/pageEncoding to UTF-8
+    source = _re.sub(
+        r'(charset\s*=\s*)(?!UTF-8|utf-8)([^\s"\'%;>]+)',
+        r'\1UTF-8', source, flags=_re.I,
+    )
+    source = _re.sub(
+        r'(pageEncoding\s*=\s*["\'])(?!UTF-8|utf-8)([^"\']+)(["\'])',
+        r'\1UTF-8\3', source, flags=_re.I,
+    )
+
+    # 2. Rename 'enum' variable name (reserved keyword since Java 5)
+    source = _re.sub(r'\benum\b', 'enumIt', source)
+
+    # 3. Drop unresolvable oracle.jdbc imports (can't add driver to classpath)
+    source = _re.sub(r'<%@\s*page\s+import="oracle\.jdbc[^"]*"%>\s*\n?', '', source)
+    source = _re.sub(r'<%@\s*page\s+import="oracle\.[^"]*"%>\s*\n?', '', source)
+
+    # 4. request.getRealPath() removed in Jakarta Servlet 5.0 (Tomcat 10+);
+    #    use getServletContext().getRealPath() instead
+    source = _re.sub(r'\brequest\.getRealPath\s*\(', 'getServletContext().getRealPath(', source)
+
+    # 5. Invalid Java string escape sequences (e.g. \k, \p) — strip the
+    #    backslash so the string literal still compiles
+    source = _re.sub(r'\\([^\\btnfr"\'0-7u\n\r])', r'\1', source)
+
+    return source
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -312,6 +471,11 @@ def compile_jsp(jsp_path: Path) -> tuple[str, list[str]]:
     WEBAPPS_DIR.mkdir(parents=True, exist_ok=True)
 
     source = jsp_path.read_text(errors="replace")
+    # Tomcat 10 uses jakarta.* — rewrite old javax.servlet/websocket references
+    source = (source
+              .replace("javax.servlet", "jakarta.servlet")
+              .replace("javax.websocket", "jakarta.websocket"))
+    source = _compat_source(source)
 
     # Pre-pass: if a WEB-INF/ exists near the JSP, inject it into the container
     # so Jasper can resolve app-specific classes during Pass 1.

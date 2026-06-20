@@ -217,32 +217,36 @@ Example console output for a flagged file:
 
 ### JSP webshell evaluation (this release)
 
-Evaluated on **280 real-world JSP webshells** + **500 benign `.class` files**:
+Evaluated on **280 JSP files** (161 malicious, 119 benign) from a real-world
+corpus covering exec shells, file-write droppers, JDBC database dumpers,
+memory/fileless shells, obfuscated variants (unicode/octal escaping, char-array
+strings, base64-embedded bytecode), and multi-stage stagers.
 
 | Metric | Score |
 |---|---|
-| **Accuracy** | **99.0%** |
-| **Precision** | **99.3%** |
-| **Recall** | **97.9%** |
-| **F1 Score** | **98.6%** |
-| **Specificity** | **99.6%** |
-| **False Positive Rate** | **0.4%** |
+| **F1 Score** | **0.975** |
+| **Precision** | **0.964** |
+| **Recall** | **0.988** |
+| **Accuracy** | **0.971** |
+| True Positives | 159 |
+| False Positives | 6 |
+| True Negatives | 113 |
+| False Negatives | 2 |
 
-Confusion matrix:
+![Confusion matrix](shellbreaker_confusion_matrix.png)
 
-```
-                   Predicted WEBSHELL   Predicted BENIGN
-Actual WEBSHELL         274 (97.9%)          6 (2.1%)
-Actual BENIGN             2 (0.4%)         498 (99.6%)
-```
+**Remaining false positives (6):** All are benign JSPs that the ML model scores
+≥ 0.93 with no rule or dynamic evidence. Only fixable by retraining on
+additional negative examples.
 
-The 6 missed shells are multi-stage stager pages (pure `response.sendRedirect()`
-or zero-scriptlet templates) whose payload lives in a separate file — they are
-undetectable by isolated static analysis regardless of tool.
-
-The 2 false positives are `MatrixUtils` (legitimate `setAccessible` in Apache
-Commons Math) and `NevilleInterpolator` (class name contains the substring
-"evil"). Both are MEDIUM verdicts, not CONFIRMED/HIGH.
+**Remaining false negatives (2):**
+- `validateRefundMgr.jsp` — bytecode-dropper: embeds a raw compiled `.class`
+  (CAFEBABE magic) as a base64 string in JSP template text. The compiled JSP
+  itself is genuinely benign-looking; the payload is delivered to the attacker
+  out-of-band. Undetectable by bytecode analysis alone.
+- `reportVendorForm.jsp` — compilation fails due to app-specific taglib
+  dependencies not present in the standalone Tomcat container; source rules
+  find no match in the stripped content.
 
 ### .class file baseline evaluation
 
