@@ -4,7 +4,7 @@ Detects Java webshells (file-based and fileless/memory) in `.class` and `.jsp` f
 Uses a hybrid pipeline: ResNet50 opcode-image model + rule engine + optional dynamic
 analysis via a Java agent attached to Docker Tomcat.
 ### DISCLAIMER: This repo was originally designed to detect MEMSHELL not webshell, please use it wisely, some of your .jsp code may crash.
-### ~~Who to contact (blame): email is in my profile~~
+### Who to ~~blame~~ contact: email is in my profile
 ---
 
 ## Table of Contents
